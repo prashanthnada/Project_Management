@@ -1,0 +1,1729 @@
+import sys
+import pandas as pd
+import plotly.express as px
+import sqlite3
+import os
+import tempfile
+import webbrowser
+from datetime import datetime, date
+
+from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit,
+                             QLabel, QDateEdit, QTreeView, QMessageBox, QComboBox, QHeaderView, QDesktopWidget,
+                             QTextEdit, QInputDialog, QSpacerItem, QSizePolicy, QDialog, QDialogButtonBox, QTabWidget,
+                             QFileDialog)
+from PyQt5.QtCore import QDate, Qt, QAbstractItemModel, QModelIndex
+from PyQt5.QtGui import QIntValidator, QBrush, QColor
+
+# --- Custom Exception Hook for better error reporting ---
+def excepthook(exc_type, exc_value, exc_traceback):
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+    sys.exit(1)
+sys.excepthook = excepthook
+# --- End of Custom Exception Hook ---
+
+# --- TaskNode Class for Hierarchical Data ---
+class TaskNode:
+    """Represents a single task or subtask in the hierarchical tree."""
+    def __init__(self, task_id, name, start, end, resource, completion, remarks, completed_date, parent=None, parent_db_id=None):
+        self.task_id = task_id
+        self.name = name
+        self.start_date = start
+        self.end_date = end
+        self.resource = resource
+        self.completion = completion
+        self.remarks = remarks
+        self.completed_date = completed_date
+        self.parent = parent  # Reference to the parent TaskNode
+        self.parent_db_id = parent_db_id # Stored for DB operations, can be None for top-level
+        self.children = []    # List of child TaskNode objects
+
+    def appendChild(self, node):
+        """Adds a child node to this task."""
+        self.children.append(node)
+        # Optional: Sort children, e.g., by start date or name
+        self.children.sort(key=lambda x: (x.start_date, x.name.lower()))
+
+    def child(self, row):
+        """Returns the child node at the given row index."""
+        if row < 0 or row >= len(self.children):
+            return None
+        return self.children[row]
+
+    def childCount(self):
+        """Returns the number of children for this task."""
+        return len(self.children)
+
+    def columnCount(self):
+        """Returns the number of data columns for this task (matches headers)."""
+        # Increased by 1 for "Task No."
+        return 10 # Task No., Task, Start Date, End Date, Duration, Pending, Resource, Completion, Remarks, Status
+
+    def data(self, column):
+        """Returns the data for a specific column."""
+        today = date(2025, 7, 8) # Fixed to Tuesday, July 8, 2025 as per instruction
+        try:
+            start_dt = datetime.strptime(self.start_date, "%Y-%m-%d").date()
+            end_dt = datetime.strptime(self.end_date, "%Y-%m-%d").date()
+            duration = (end_dt - start_dt).days + 1
+            pending_days = (end_dt - today).days
+        except ValueError:
+            duration = "N/A"
+            pending_days = "N/A"
+
+        # Determine task status for display
+        status_text = ""
+
+        # 1. Check for Completed status first (most restrictive)
+        # A task is "Completed" only if its own completion is 100% AND all its descendants are 100%
+        if self.completion == 100 and not self.has_incomplete_descendants():
+            status_text = "Completed"
+        # 2. Check for Overdue status (takes precedence over In Progress)
+        # A task is Overdue if its own end date has passed AND it's not 100% complete
+        # OR if any of its children (recursively) are overdue.
+        elif self.is_overdue(today) or self.has_overdue_descendants(today):
+            status_text = "Overdue"
+        # 3. Check for In Progress status
+        # A task is "In Progress" if its own completion is > 0% AND < 100%
+        # OR if it has ANY descendant (direct or indirect) that is currently 'In Progress' or 'Overdue'.
+        elif self.completion > 0 or self.has_any_child_in_progress_or_overdue(today): # Pass today's date
+            status_text = "In Progress"
+        # 4. Otherwise, it's "Not Started"
+        else:
+            status_text = "Not Started"
+
+        if column == 0: return self.row() + 1 # Task Number (1-based index)
+        elif column == 1: return self.name
+        elif column == 2: return self.start_date
+        elif column == 3: return self.end_date
+        elif column == 4: return str(duration)
+        elif column == 5: return str(pending_days) if isinstance(pending_days, int) else pending_days
+        elif column == 6: return self.resource
+        elif column == 7: return str(self.completion)
+        elif column == 8: return self.remarks
+        elif column == 9: return status_text
+        return None
+
+    def row(self):
+        """Returns the row number of this task among its siblings."""
+        if self.parent:
+            return self.parent.children.index(self)
+        return 0 # For root node (shouldn't happen for actual tasks in a QTreeView model)
+
+    def is_overdue(self, current_date):
+        """Checks if the task itself (not its children) is overdue."""
+        if self.completion < 100:
+            try:
+                end_dt = datetime.strptime(self.end_date, "%Y-%m-%d").date()
+                return (end_dt - current_date).days < 0
+            except ValueError:
+                return False
+        return False
+    
+    def has_overdue_descendants(self, current_date):
+        """Recursively checks if any direct or indirect child is overdue."""
+        for child in self.children:
+            if child.is_overdue(current_date):
+                return True
+            if child.has_overdue_descendants(current_date): # Recursive call
+                return True
+        return False
+
+    def has_incomplete_descendants(self):
+        """
+        Recursively checks if this task or any of its children (and their children)
+        are less than 100% complete.
+        """
+        if self.completion < 100:
+            return True
+        for child in self.children:
+            if child.has_incomplete_descendants(): # Recursive call
+                return True
+        return False
+
+    def has_any_child_in_progress_or_overdue(self, current_date):
+        """
+        Recursively checks if any direct or indirect child is 'In Progress' or 'Overdue'.
+        This helps determine if a parent should be 'In Progress' even if its own completion is 0%.
+        """
+        for child in self.children:
+            # Re-evaluate the child's status based on current_date
+            child_status = ""
+            if child.completion == 100 and not child.has_incomplete_descendants():
+                child_status = "Completed"
+            elif child.is_overdue(current_date) or child.has_overdue_descendants(current_date): # Check overdue for child and its descendants
+                child_status = "Overdue"
+            elif child.completion > 0 or child.has_any_child_in_progress_or_overdue(current_date): # Recursive check for children's status
+                child_status = "In Progress"
+            else:
+                child_status = "Not Started"
+
+            if child_status in ["In Progress", "Overdue"]:
+                return True
+        return False
+
+
+    def get_display_color(self):
+        """Returns the background color based on task status."""
+        color_completed = QColor(198, 239, 206) # Lighter Green
+        color_overdue = QColor(255, 204, 204)   # Lighter Red
+        color_in_progress = QColor(255, 240, 180) # Lighter Yellow
+        color_not_started = QColor(240, 248, 255) # Alice Blue (slightly off-white)
+
+        today = date(2025, 7, 8) # Fixed to Tuesday, July 8, 2025 as per instruction
+
+        # Apply the new status logic for coloring too
+        # The logic here should mirror the data() method's status determination
+        if self.completion == 100 and not self.has_incomplete_descendants():
+            return color_completed
+        elif self.is_overdue(today) or self.has_overdue_descendants(today): # Apply new overdue logic
+            return color_overdue
+        elif self.completion > 0 or self.has_any_child_in_progress_or_overdue(today): # Match new 'In Progress' logic, pass today's date
+            return color_in_progress
+        return color_not_started
+
+# --- Custom QAbstractItemModel for Task Hierarchy ---
+class TaskTreeModel(QAbstractItemModel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.rootItem = TaskNode(None, "Root", "", "", "", 0, "", "", None) # Invisible root item
+        # Updated column headers to include "Task No."
+        self.column_headers = ["Task No.", "Task", "Start Date", "End Date", "Duration (Days)", "Pending Days", "Resource", "Completion %", "Remarks", "Status"]
+
+        self._filter_text = ""
+        self._filter_status = "All"
+        self._filter_resource = "All"
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(self.column_headers)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+
+        node = index.internalPointer()
+
+        if role == Qt.DisplayRole:
+            return node.data(index.column())
+        elif role == Qt.BackgroundRole:
+            return QBrush(node.get_display_color())
+        elif role == Qt.ForegroundRole and index.column() == 5: # Pending Days column (adjusted index for new column)
+            # Use fixed date for is_overdue check
+            today = date(2025, 7, 8)
+            if node.is_overdue(today) or node.has_overdue_descendants(today): # Also highlight if child is overdue
+                return QBrush(QColor("red"))
+        elif role == Qt.ToolTipRole:
+            today = date(2025, 7, 8)
+            if index.column() == 5 and (node.is_overdue(today) or node.has_overdue_descendants(today)): # Adjusted index
+                try:
+                    end_dt = datetime.strptime(node.end_date, "%Y-%m-%d").date()
+                    pending_days = (end_dt - today).days
+                    return f"Overdue by {-pending_days} days!"
+                except ValueError:
+                    pass
+            elif index.column() == 5 and node.completion < 100: # Adjusted index
+                try:
+                    end_dt = datetime.strptime(node.end_date, "%Y-%m-%d").date()
+                    if (end_dt - today).days == 0:
+                        return "Due today!"
+                except ValueError:
+                    pass
+        elif role == Qt.TextAlignmentRole and index.column() == 8: # Remarks column (adjusted index)
+            return int(Qt.AlignTop | Qt.AlignLeft)
+        elif role == Qt.TextAlignmentRole and index.column() == 0: # Task No. column
+            return int(Qt.AlignCenter)
+        elif role == Qt.TextAlignmentRole and index.column() in [4, 5, 7]: # Duration, Pending, Completion %
+            return int(Qt.AlignCenter)
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if orientation == Qt.Horizontal and role == Qt.DisplayRole:
+            return self.column_headers[section]
+        return None
+
+    def index(self, row, column, parent=QModelIndex()):
+        if not self.hasIndex(row, column, parent):
+            return QModelIndex()
+
+        parentNode = self.nodeFromIndex(parent)
+        childNode = parentNode.child(row)
+        if childNode:
+            return self.createIndex(row, column, childNode)
+        return QModelIndex()
+
+    def parent(self, index):
+        if not index.isValid():
+            return QModelIndex()
+
+        childNode = index.internalPointer()
+        parentNode = childNode.parent
+
+        if parentNode == self.rootItem:
+            return QModelIndex()
+
+        return self.createIndex(parentNode.row(), 0, parentNode)
+
+    def rowCount(self, parent=QModelIndex()):
+        if parent.column() > 0:
+            return 0
+        
+        parentNode = self.nodeFromIndex(parent)
+        return parentNode.childCount()
+
+    def nodeFromIndex(self, index):
+        if index.isValid():
+            return index.internalPointer()
+        return self.rootItem
+    
+    def setFilterText(self, text):
+        if self._filter_text != text:
+            self._filter_text = text
+            # Do not emit layoutChanged directly here; it's handled by setupModelData
+
+    def setFilterStatus(self, status):
+        if self._filter_status != status:
+            self._filter_status = status
+            # Do not emit layoutChanged directly here; it's handled by setupModelData
+
+    def setFilterResource(self, resource):
+        if self._filter_resource != resource:
+            self._filter_resource = resource
+            # Do not emit layoutChanged directly here; it's handled by setupModelData
+
+    def _passes_filter(self, node, current_date):
+        """
+        Checks if a single node (and its descendants) passes all current filters.
+        This function is used to identify the "root" of a visible branch.
+        """
+        # Check if the node itself matches filters
+        matches_text = (self._filter_text.lower() in node.name.lower() or 
+                        self._filter_text.lower() in (node.resource.lower() if node.resource else '') or
+                        self._filter_text.lower() in (node.remarks.lower() if node.remarks else ''))
+        
+        node_status = node.data(9) # Get the computed status of the node itself (column index 9 for Status)
+
+        matches_status = (self._filter_status == "All" or node_status == self._filter_status)
+        matches_resource = (self._filter_resource == "All" or 
+                            (node.resource and node.resource.lower() == self._filter_resource.lower()))
+
+        # A node passes if it directly matches filters
+        if (matches_text or not self._filter_text) and \
+           (matches_status or self._filter_status == "All") and \
+           (matches_resource or self._filter_resource == "All"):
+            return True
+
+        # If this node doesn't match directly, check if any of its children match.
+        # This ensures parent nodes are marked as "initially visible" if their *descendants* are part of the filter.
+        for child in node.children: # NOTE: node.children here refer to the COMPLETE children list from the full tree
+            if self._passes_filter(child, current_date): # Recursive call
+                return True
+        return False
+
+
+    def setupModelData(self, tasks_data):
+        """
+        Builds the tree structure from a flat list of tasks data, applying filters.
+        tasks_data: List of dictionaries, each representing a task from the DB,
+                    including 'id' and 'parent_task_id'.
+        """
+        self.beginResetModel()
+        self.rootItem = TaskNode(None, "Root", "", "", "", 0, "", "", None) # Invisible root item
+
+        if not tasks_data:
+            self.endResetModel()
+            return
+
+        # Phase 1: Build the complete, unfiltered hierarchy of all tasks in a temporary map.
+        # This map will hold TaskNode objects with their full original hierarchy (children lists).
+        nodes_by_id = {}
+        for task_row in tasks_data:
+            node = TaskNode(
+                task_row["id"], task_row["task_name"], task_row["start_date"],
+                task_row["end_date"], task_row["resource"], task_row["completion"],
+                task_row["remarks"], task_row["completed_date"],
+                parent_db_id=task_row["parent_task_id"]
+            )
+            nodes_by_id[task_row["id"]] = node
+
+        # Establish parent-child relationships for the *full* tree using node references
+        # Temporarily append them to the model's rootItem so we can traverse the full tree for filtering.
+        # These are *references* to the nodes in nodes_by_id, not copies.
+        for task_id, node in nodes_by_id.items():
+            if node.parent_db_id is not None and node.parent_db_id in nodes_by_id:
+                parent_node = nodes_by_id[node.parent_db_id]
+                parent_node.appendChild(node)
+                node.parent = parent_node # Set actual parent TaskNode reference
+            else:
+                self.rootItem.appendChild(node)
+                node.parent = self.rootItem # Set actual parent TaskNode reference
+
+
+        # Phase 2: Determine which nodes should be visible based on current filters.
+        # A node is initially visible if it passes the filter directly OR if any of its descendants pass.
+        # This set will contain matching nodes and their ancestors, forming the *paths* to matches.
+        initially_visible_nodes_ids = set()
+        today = date(2025, 7, 8) # Fixed date for status calculation
+
+        # Traverse the temporarily built full tree from its top-level nodes (children of rootItem)
+        # and identify all nodes (and their ancestors) that need to be initially visible to form the path.
+        for node in self.rootItem.children: # These are the project's actual top-level tasks (from full tree)
+            if self._passes_filter(node, today): # This recursive check pulls in ancestors
+                current = node
+                while current and current != self.rootItem:
+                    initially_visible_nodes_ids.add(current.task_id)
+                    current = current.parent
+
+
+        # Phase 3: Construct the *final* visible tree structure for the QTreeView model.
+        # Ensure that if a node is initially visible (part of a path to a match),
+        # then *all* its descendants are also visible in the final model.
+        
+        # Clear the rootItem's children from the temporary full tree built in Phase 1.
+        # This rootItem will now be rebuilt with the final visible structure.
+        self.rootItem.children = [] 
+
+        # Create new TaskNode objects for all tasks that should be in the final model.
+        final_model_nodes_map = {}
+        
+        # Use a queue for a breadth-first traversal to collect all nodes that should be visible.
+        # Start the queue with the IDs of nodes identified in Phase 2.
+        queue_for_final_visibility = list(initially_visible_nodes_ids)
+        # Keep track of IDs already added to final_model_nodes_map to avoid duplicates.
+        added_to_final_model_map = set(initially_visible_nodes_ids)
+
+        # First, add the 'initially_visible_nodes_ids' to the map, but don't link them yet.
+        # We need them in the map before processing their children.
+        for task_id in initially_visible_nodes_ids:
+            original_node = nodes_by_id.get(task_id)
+            if original_node: # Should always be true if initially_visible_nodes_ids is derived from nodes_by_id
+                new_node = TaskNode(
+                    original_node.task_id, original_node.name, original_node.start_date,
+                    original_node.end_date, original_node.resource, original_node.completion,
+                    original_node.remarks, original_node.completed_date,
+                    parent_db_id=original_node.parent_db_id
+                )
+                final_model_nodes_map[task_id] = new_node
+
+        # Now, process the queue to add all descendants of the initially visible nodes.
+        while queue_for_final_visibility:
+            current_id = queue_for_final_visibility.pop(0)
+            original_node = nodes_by_id.get(current_id) # Get the original node from the full tree
+
+            if original_node:
+                for original_child in original_node.children:
+                    if original_child.task_id not in added_to_final_model_map:
+                        # This child is a descendant of a node already in the final model
+                        # AND it hasn't been added yet. Add it and queue its children.
+                        new_child_node = TaskNode(
+                            original_child.task_id, original_child.name, original_child.start_date,
+                            original_child.end_date, original_child.resource, original_child.completion,
+                            original_child.remarks, original_child.completed_date,
+                            parent_db_id=original_child.parent_db_id
+                        )
+                        final_model_nodes_map[original_child.task_id] = new_child_node
+                        added_to_final_model_map.add(original_child.task_id)
+                        queue_for_final_visibility.append(original_child.task_id) # Add child's ID to queue to process its children
+
+        # Finally, link the new TaskNode objects in final_model_nodes_map to form the actual model tree.
+        # Iterate through the original raw tasks_data to ensure correct parent_db_id matching and ordering.
+        for task_row in tasks_data:
+            task_id = task_row["id"]
+            if task_id in final_model_nodes_map: # Only process tasks that are meant to be in the final model
+                node = final_model_nodes_map[task_id]
+                # If the node's original parent is also in the final_model_nodes_map, link it.
+                if node.parent_db_id is not None and node.parent_db_id in final_model_nodes_map:
+                    parent_node = final_model_nodes_map[node.parent_db_id]
+                    parent_node.appendChild(node)
+                    node.parent = parent_node # Set parent reference for model traversal
+                else:
+                    # Otherwise, it's a top-level visible task (either truly top-level or its parent wasn't visible
+                    # but it's part of a branch that became visible, or it's just a top-level match).
+                    self.rootItem.appendChild(node)
+                    node.parent = self.rootItem # Set parent reference to the model's root
+
+        self.endResetModel()
+
+    def find_node_by_db_id(self, db_id):
+        """Recursively finds a TaskNode by its database ID."""
+        return self._find_node_recursive(self.rootItem, db_id)
+
+    def _find_node_recursive(self, current_node, db_id):
+        if current_node.task_id == db_id:
+            return current_node
+        for child in current_node.children:
+            found_node = self._find_node_recursive(child, db_id)
+            if found_node:
+                return found_node
+        return None
+
+    def get_all_flat_tasks_data(self):
+        """Returns a flat list of dictionaries for all tasks, including hierarchy info, from the *model's current visible data*."""
+        flat_list = []
+        def traverse(node, level=0):
+            if node != self.rootItem:
+                # Get the current displayed status, not recalculate
+                status_at_display = node.data(9) # Column 9 is Status
+
+                flat_list.append({
+                    "id": node.task_id,
+                    "task_name": node.name,
+                    "start_date": node.start_date,
+                    "end_date": node.end_date,
+                    "resource": node.resource,
+                    "completion": node.completion,
+                    "remarks": node.remarks,
+                    "completed_date": node.completed_date,
+                    "parent_task_id": node.parent_db_id,
+                    "level": level, # Useful for indentation in Gantt chart/Excel
+                    "status_text": status_at_display # Include the calculated status
+                })
+            for child in node.children:
+                traverse(child, level + 1)
+        
+        traverse(self.rootItem)
+        return flat_list
+
+# --- Main Application Class ---
+class ProjectManagerApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Professional Project Manager")
+        self.setGeometry(100, 100, 1400, 800)
+        self.center_window()
+
+        self.data_file = "project_data.db"
+        self.conn = None
+        self.cursor = None
+
+        self.init_db()
+
+        self.selected_task_node = None # Stores the TaskNode object of the selected task
+        self.current_project_tasks_raw = [] # Flat list of dicts for current project, unfiltered from DB
+
+        self.all_resources = set()
+
+        self.apply_styles()
+        self.init_ui()
+        self.populate_project_selector()
+
+    def center_window(self):
+        qr = self.frameGeometry()
+        cp = QDesktopWidget().availableGeometry().center()
+        qr.moveCenter(cp)
+        self.move(qr.topLeft())
+
+    def apply_styles(self):
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #f0f2f5;
+                font-family: "Segoe UI", sans-serif;
+                font-size: 14px;
+                color: #333;
+            }
+
+            QLabel {
+                color: #555;
+                font-weight: 500;
+            }
+
+            QLineEdit, QDateEdit, QComboBox, QTextEdit {
+                padding: 8px;
+                border: 1px solid #ccc;
+                border-radius: 5px;
+                background-color: #fff;
+                selection-background-color: #a8d0f5;
+            }
+            QLineEdit:focus, QDateEdit:focus, QComboBox:focus, QTextEdit:focus {
+                border-color: #007bff;
+                box-shadow: 0 0 0 2px rgba(0, 123, 255, 0.25);
+            }
+            
+            QPushButton {
+                background-color: #007bff;
+                color: white;
+                padding: 10px 15px;
+                border: none;
+                border-radius: 5px;
+                font-weight: bold;
+                transition: background-color 0.2s ease;
+            }
+            QPushButton:hover {
+                background-color: #0056b3;
+            }
+            QPushButton:pressed {
+                background-color: #004085;
+            }
+            QPushButton#deleteBtn {
+                background-color: #dc3545;
+            }
+            QPushButton#deleteBtn:hover {
+                background-color: #c82333;
+            }
+            QPushButton#editBtn {
+                background-color: #ffc107;
+                color: #333;
+            }
+            QPushButton#editBtn:hover {
+                background-color: #e0a800;
+            }
+
+            QTreeView { /* Styling for QTreeView */
+                background-color: #ffffff;
+                border: 1px solid #e0e0e0;
+                border-radius: 5px;
+                gridline-color: #e0e0e0;
+                selection-background-color: #cce5ff;
+                selection-color: #333;
+            }
+            QTreeView::item {
+                padding: 7px 5px;
+                border-bottom: 1px solid #f0f0f0;
+            }
+            QTreeView::item:selected {
+                background-color: #a8d0f5;
+                color: #333;
+            }
+            /* Custom branch indicators for QTreeView */
+            QTreeView::branch:closed:has-children {
+                image: url(data:image/png;base64,iVBORw0KGgoAAAAHAAAABwCAYAAAD5ecIWAAAAAXNSR0IArs4c6QAAAHBJREFUGBljwAtY2BjQ+A0GxgZhQnIwMjLwMjD6/x8FxsDMwMBjBgYGRiYwMDMwMDAxMDJ0AwMDAwYGxiwGBgYGrAQGMjAxMzAwMDAxMDLw/z8DAwMDswMDAwNjkFkZGBgZGBkZGdgYAQIGwDkLGBgZqf8/AwMDAAEABzFhR2h11wEAAAAASUVORK5CYII=); /* Right-facing arrow (small, solid) */
+            }
+            QTreeView::branch:open:has-children {
+                image: url(data:image/png;base64,iVBORw0KGgoAAAAHAAAABwCAYAAAD5ecIWAAAAAXNSR0IArs4c6QAAAHJJREFUGBljwAtY2BjQ+A0GxgZhQnIwMjLwMjD6/x8FxsDMwMBjBgYGRiYwMDMwMDAxMDJ0AwMDAwYGxiwGBgYGrAQGMjAxMzAwMDAxMDLw/z8DAwMDswMDAwNjkFkZGBgZGBkZGdgYAQIGwDkLGBgZqf8/AwMDAAEABzFhR2h11wEAAAAASUVORK5CYII=); /* Down-facing arrow (small, solid) */
+            }
+            QHeaderView::section {
+                background-color: #e9ecef;
+                color: #495057;
+                padding: 8px;
+                border: 1px solid #dee2e6;
+                font-weight: bold;
+                font-size: 15px;
+            }
+            QHeaderView::section:horizontal {
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }
+            QHeaderView::section:first { border-left: none; }
+            QHeaderView::section:last { border-right: none; }
+
+            QComboBox::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 20px;
+                border-left-width: 1px;
+                border-left-color: #ccc;
+                border-left-style: solid;
+                border-top-right-radius: 5px;
+                border-bottom-right-radius: 5px;
+            }
+
+            QTabWidget::pane { border-top: 1px solid #c2c7cb; background-color: #ffffff; }
+            QTabWidget::tab-bar { left: 5px; }
+            QTabBar::tab {
+                background: #e9ecef; border: 1px solid #c2c7cb; border-bottom-color: #c2c7cb;
+                border-top-left-radius: 4px; border-top-right-radius: 4px; min-width: 8ex;
+                padding: 8px 15px; margin-right: 2px; color: #555;
+            }
+            QTabBar::tab:selected, QTabBar::tab:hover { background: #007bff; color: white; }
+            QTabBar::tab:selected { border-color: #007bff; border-bottom-color: #007bff; }
+
+            QMessageBox { background-color: #ffffff; color: #333; font-size: 14px; }
+            
+            #projectStatusLabel {
+                font-weight: bold; padding: 5px 10px; border-radius: 5px; color: white;
+            }
+            #statusNotStarted { background-color: #6c757d; }
+            #statusInProgress { background-color: #007bff; }
+            #statusCompleted { background-color: #28a745; }
+            #statusOverdue { background-color: #dc3545; }
+        """)
+
+    def init_db(self):
+        """Initializes the SQLite database connection and creates tables if they don't exist."""
+        try:
+            self.conn = sqlite3.connect(self.data_file)
+            self.cursor = self.conn.cursor()
+
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS Projects (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    description TEXT DEFAULT ''
+                )
+            """)
+            self.cursor.execute("PRAGMA table_info(Projects)")
+            columns = [info[1] for info in self.cursor.fetchall()]
+            if 'description' not in columns:
+                self.cursor.execute("ALTER TABLE Projects ADD COLUMN description TEXT DEFAULT ''")
+            
+            # Create Tasks table with new 'remarks', 'completed_date', and 'parent_task_id' columns
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS Tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id INTEGER,
+                    task_name TEXT NOT NULL,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT NOT NULL,
+                    resource TEXT,
+                    completion INTEGER,
+                    remarks TEXT DEFAULT '',
+                    completed_date TEXT,
+                    parent_task_id INTEGER, -- New column for parent task ID
+                    FOREIGN KEY (project_id) REFERENCES Projects(id) ON DELETE CASCADE,
+                    FOREIGN KEY (parent_task_id) REFERENCES Tasks(id) ON DELETE CASCADE
+                )
+            """)
+            # Add new columns if they don't exist (robustness for existing databases)
+            self.cursor.execute("PRAGMA table_info(Tasks)")
+            columns = [info[1] for info in self.cursor.fetchall()]
+            if 'remarks' not in columns:
+                self.cursor.execute("ALTER TABLE Tasks ADD COLUMN remarks TEXT DEFAULT ''")
+            if 'completed_date' not in columns:
+                self.cursor.execute("ALTER TABLE Tasks ADD COLUMN completed_date TEXT")
+            if 'parent_task_id' not in columns:
+                self.cursor.execute("ALTER TABLE Tasks ADD COLUMN parent_task_id INTEGER REFERENCES Tasks(id) ON DELETE CASCADE")
+
+
+            self.conn.commit()
+
+            self.cursor.execute("SELECT COUNT(*) FROM Projects")
+            if self.cursor.fetchone()[0] == 0:
+                self.cursor.execute("INSERT INTO Projects (name, description) VALUES (?, ?)", ("Default Project", "This is your default project. Feel free to rename or delete it once you've created others."))
+                self.conn.commit()
+
+        except sqlite3.Error as e:
+            QMessageBox.critical(self, "Database Error", f"Failed to connect or initialize database: {e}")
+            sys.exit(1)
+
+    def init_ui(self):
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(15)
+
+        self.tab_widget = QTabWidget()
+
+        self.task_management_tab = QWidget()
+        self.task_management_layout = QVBoxLayout(self.task_management_tab)
+        self.task_management_layout.setContentsMargins(10, 10, 10, 10)
+        self.task_management_layout.setSpacing(10)
+
+        # Project Selector, Add New Project, Edit Project, Delete Project
+        project_control_layout = QHBoxLayout()
+        project_control_layout.setSpacing(10)
+
+        self.project_selector = QComboBox()
+        self.project_selector.setMinimumWidth(200)
+        self.project_selector.currentIndexChanged.connect(self.on_project_selection_changed)
+
+        self.new_project_input = QLineEdit()
+        self.new_project_input.setPlaceholderText("Enter new project name...")
+
+        self.add_project_btn = QPushButton("Add Project")
+        self.add_project_btn.clicked.connect(self.add_project)
+        
+        self.edit_project_btn = QPushButton("Edit Project Name")
+        self.edit_project_btn.setObjectName("editBtn")
+        self.edit_project_btn.clicked.connect(self.edit_project_name)
+
+        self.delete_project_btn = QPushButton("Delete Project")
+        self.delete_project_btn.setObjectName("deleteBtn")
+        self.delete_project_btn.clicked.connect(self.delete_current_project)
+
+        project_control_layout.addWidget(QLabel("<b>Project:</b>"))
+        project_control_layout.addWidget(self.project_selector)
+        project_control_layout.addWidget(self.new_project_input)
+        project_control_layout.addWidget(self.add_project_btn)
+        project_control_layout.addWidget(self.edit_project_btn)
+        project_control_layout.addWidget(self.delete_project_btn)
+        project_control_layout.addStretch(1)
+
+        self.task_management_layout.addLayout(project_control_layout)
+        
+        # Project Description and Status
+        project_details_layout = QHBoxLayout()
+        project_details_layout.setContentsMargins(0,0,0,0)
+        project_details_layout.setSpacing(10)
+        
+        desc_layout = QVBoxLayout()
+        desc_layout.setContentsMargins(0,0,0,0)
+        desc_layout.setSpacing(5)
+        desc_layout.addWidget(QLabel("<b>Project Description:</b>"))
+        
+        self.project_description_text = QTextEdit()
+        self.project_description_text.setPlaceholderText("Enter a description for the project...")
+        self.project_description_text.setFixedHeight(60)
+        self.project_description_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.project_description_text.textChanged.connect(self.save_project_description_on_change)
+        desc_layout.addWidget(self.project_description_text)
+
+        status_layout = QVBoxLayout()
+        status_layout.setContentsMargins(0,0,0,0)
+        status_layout.setSpacing(5)
+        status_layout.addWidget(QLabel("<b>Project Status:</b>"))
+        self.project_status_label = QLabel("Not Yet Started")
+        self.project_status_label.setObjectName("projectStatusLabel")
+        self.project_status_label.setAlignment(Qt.AlignCenter)
+        self.project_status_label.setMinimumWidth(150)
+        self.project_status_label.setFixedHeight(30)
+        status_layout.addWidget(self.project_status_label)
+        status_layout.addStretch(1)
+
+        project_details_layout.addLayout(desc_layout, 2)
+        project_details_layout.addLayout(status_layout, 1)
+        
+        self.task_management_layout.addLayout(project_details_layout)
+
+
+        # Task Input/Edit Layout
+        task_edit_group_layout = QVBoxLayout()
+        task_edit_group_layout.setContentsMargins(0,0,0,0)
+        task_edit_group_layout.setSpacing(5)
+
+        # Row 1 of Task Input
+        task_input_row1 = QHBoxLayout()
+        task_input_row1.setSpacing(10)
+        task_input_row1.addWidget(QLabel("Task Name:"))
+        self.task_name = QLineEdit()
+        self.task_name.setPlaceholderText("Enter task name")
+        task_input_row1.addWidget(self.task_name)
+        task_input_row1.addWidget(QLabel("Parent Task:"))
+        self.parent_task_selector = QComboBox() # New: for selecting parent task
+        self.parent_task_selector.setPlaceholderText("Select parent (optional)")
+        self.parent_task_selector.setMinimumWidth(200)
+        self.parent_task_selector.addItem("--- No Parent ---", userData=None) # Option for top-level task
+        task_input_row1.addWidget(self.parent_task_selector)
+        task_input_row1.addStretch(1)
+        task_edit_group_layout.addLayout(task_input_row1)
+
+        # Row 2 of Task Input
+        task_input_row2 = QHBoxLayout()
+        task_input_row2.setSpacing(10)
+        task_input_row2.addWidget(QLabel("Start Date:"))
+        self.start_date = QDateEdit()
+        self.start_date.setDate(QDate.currentDate())
+        self.start_date.setCalendarPopup(True)
+        task_input_row2.addWidget(self.start_date)
+        task_input_row2.addWidget(QLabel("End Date:"))
+        self.end_date = QDateEdit()
+        self.end_date.setDate(QDate.currentDate().addDays(7))
+        self.end_date.setCalendarPopup(True)
+        task_input_row2.addWidget(self.end_date)
+        task_input_row2.addWidget(QLabel("Resource:"))
+        self.resource = QComboBox()
+        self.resource.setEditable(True)
+        self.resource.setPlaceholderText("Assigned Resource")
+        task_input_row2.addWidget(self.resource)
+        task_input_row2.addWidget(QLabel("Done %:"))
+        self.completion = QLineEdit()
+        self.completion.setPlaceholderText("% Completion (0-100)")
+        self.completion.setValidator(QIntValidator(0, 100))
+        task_input_row2.addWidget(self.completion)
+        task_input_row2.addStretch(1)
+        task_edit_group_layout.addLayout(task_input_row2)
+
+        # Row 3 of Task Input (Remarks)
+        task_input_row3 = QHBoxLayout()
+        task_input_row3.setSpacing(10)
+        task_input_row3.addWidget(QLabel("Remarks:"))
+        self.remarks = QTextEdit()
+        self.remarks.setPlaceholderText("Remarks/Comments")
+        self.remarks.setAcceptRichText(False)
+        self.remarks.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.remarks.setFixedHeight(60)
+        task_input_row3.addWidget(self.remarks)
+        task_input_row3.addStretch(1)
+        task_edit_group_layout.addLayout(task_input_row3)
+
+
+        # Add/Clear Buttons
+        task_action_buttons = QHBoxLayout()
+        task_action_buttons.setSpacing(10)
+        self.add_update_task_btn = QPushButton("Add Task")
+        self.add_update_task_btn.clicked.connect(self.add_or_update_task)
+        self.clear_fields_btn = QPushButton("Clear Fields")
+        self.clear_fields_btn.clicked.connect(self.clear_task_input_fields)
+        task_action_buttons.addWidget(self.add_update_task_btn)
+        task_action_buttons.addWidget(self.clear_fields_btn)
+        task_action_buttons.addStretch(1)
+        task_edit_group_layout.addLayout(task_action_buttons)
+
+        self.task_management_layout.addLayout(task_edit_group_layout)
+
+        # --- Filter Options ---
+        filter_layout = QHBoxLayout()
+        filter_layout.setContentsMargins(0, 5, 0, 5) # Slight vertical padding
+        filter_layout.setSpacing(10)
+
+        filter_layout.addWidget(QLabel("<b>Search:</b>"))
+        self.search_task_input = QLineEdit()
+        self.search_task_input.setPlaceholderText("Search task name/resource/remarks...")
+        self.search_task_input.textChanged.connect(self.apply_filters)
+        filter_layout.addWidget(self.search_task_input)
+
+        filter_layout.addWidget(QLabel("<b>Status:</b>"))
+        self.filter_status_combo = QComboBox()
+        self.filter_status_combo.addItems(["All", "Not Started", "In Progress", "Completed", "Overdue"])
+        self.filter_status_combo.currentIndexChanged.connect(self.apply_filters)
+        filter_layout.addWidget(self.filter_status_combo)
+
+        filter_layout.addWidget(QLabel("<b>Resource:</b>"))
+        self.filter_resource_combo = QComboBox()
+        self.filter_resource_combo.addItem("All")
+        self.filter_resource_combo.currentIndexChanged.connect(self.apply_filters)
+        filter_layout.addWidget(self.filter_resource_combo)
+        
+        filter_layout.addStretch(1)
+        self.task_management_layout.addLayout(filter_layout)
+        # --- End Filter Options ---
+
+
+        # Task Tree View
+        self.tree_view = QTreeView()
+        self.task_model = TaskTreeModel(self)
+        self.tree_view.setModel(self.task_model)
+        self.tree_view.clicked.connect(self.load_task_to_fields) # Use clicked, not cellClicked
+        self.tree_view.setSelectionMode(QTreeView.ExtendedSelection) # Allow multiple selection for deletion
+        
+        # Configure column resize modes (similar to QTableWidget)
+        header = self.tree_view.header()
+        for i, header_text in enumerate(self.task_model.column_headers):
+            if header_text in ["Task No.", "Start Date", "End Date", "Duration (Days)", "Pending Days", "Completion %", "Status"]:
+                header.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+            elif header_text == "Resource":
+                header.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+            elif header_text in ["Task", "Remarks"]: # Task and Remarks should stretch
+                header.setSectionResizeMode(i, QHeaderView.Stretch)
+        self.task_management_layout.addWidget(self.tree_view, 1)
+
+        # Action Buttons below the table
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(10)
+
+        self.export_btn = QPushButton("Export Tasks to Excel")
+        self.export_btn.clicked.connect(self.export_to_excel)
+
+        self.delete_task_btn = QPushButton("Delete Selected Task(s)")
+        self.delete_task_btn.setObjectName("deleteBtn")
+        self.delete_task_btn.clicked.connect(self.delete_selected_tasks)
+
+        self.gantt_chart_button = QPushButton("Gantt Chart")
+        self.gantt_chart_button.clicked.connect(self.generate_and_open_gantt_chart)
+
+        btn_layout.addWidget(self.export_btn)
+        btn_layout.addWidget(self.delete_task_btn)
+        btn_layout.addWidget(self.gantt_chart_button)
+        btn_layout.addStretch(1)
+
+        self.task_management_layout.addLayout(btn_layout)
+        
+        self.tab_widget.addTab(self.task_management_tab, "Task Management")
+
+        main_layout.addWidget(self.tab_widget)
+        
+        # --- Add Version Label ---
+        self.version_label = QLabel("Version 1.0.0 (2025-07-08)")
+        self.version_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.version_label.setStyleSheet("font-size: 11px; color: #888; margin-top: 5px;")
+        main_layout.addWidget(self.version_label)
+        # --- End Version Label ---
+
+        self.setLayout(main_layout)
+
+        self.clear_task_input_fields()
+        self.load_all_resources() # Load resources for both input and filter combos
+
+    def get_project_id(self, project_name):
+        if not self.conn or not self.cursor: return None
+        self.cursor.execute("SELECT id FROM Projects WHERE name = ?", (project_name,))
+        result = self.cursor.fetchone()
+        return result[0] if result else None
+
+    def get_project_name_by_id(self, project_id):
+        if not self.conn or not self.cursor: return None
+        self.cursor.execute("SELECT name FROM Projects WHERE id = ?", (project_id,))
+        result = self.cursor.fetchone()
+        return result[0] if result else None
+    
+    def on_project_selection_changed(self):
+        # Reset filters when project changes
+        self.search_task_input.clear()
+        self.filter_status_combo.setCurrentIndex(0) # "All"
+        self.filter_resource_combo.setCurrentIndex(0) # "All"
+        # The above will trigger apply_filters, which calls load_tasks_for_selected_project()
+        # So we just need to ensure initial load happens without filters interfering
+        self.load_tasks_for_selected_project()
+        self.load_project_description()
+        self.update_project_status() # Status update after tasks are loaded
+        self.populate_parent_task_selector() # Refresh parent task selector when project changes
+        self.load_all_resources() # Reload all resources from DB for filtering/input
+
+    def populate_project_selector(self):
+        self.project_selector.clear()
+        if not self.conn or not self.cursor: return
+
+        try:
+            self.cursor.execute("SELECT name FROM Projects ORDER BY name COLLATE NOCASE")
+            project_names = [row[0] for row in self.cursor.fetchall()]
+            
+            self.project_selector.blockSignals(True)
+            for name in project_names:
+                self.project_selector.addItem(name)
+            self.project_selector.blockSignals(False)
+
+            if project_names:
+                current_text = self.project_selector.currentText()
+                if current_text and current_text in project_names:
+                    self.project_selector.setCurrentText(current_text)
+                else:
+                    self.project_selector.setCurrentIndex(0)
+            
+            # This will trigger on_project_selection_changed, which then loads tasks and applies filters
+            self.on_project_selection_changed()
+
+        except sqlite3.Error as e:
+            QMessageBox.critical(self, "Database Error", f"Failed to load projects: {e}")
+            self.project_selector.addItem("Error Loading Projects")
+
+    def add_project(self):
+        project_name = self.new_project_input.text().strip()
+        if not project_name:
+            QMessageBox.warning(self, "Input Error", "Project name cannot be empty.")
+            return
+
+        try:
+            self.cursor.execute("INSERT INTO Projects (name) VALUES (?)", (project_name,))
+            self.conn.commit()
+            self.populate_project_selector()
+            self.project_selector.setCurrentText(project_name)
+            self.new_project_input.clear()
+            QMessageBox.information(self, "Success", f"Project '{project_name}' added successfully.")
+        except sqlite3.IntegrityError:
+            QMessageBox.warning(self, "Duplicate Project", f"Project '{project_name}' already exists.")
+        except sqlite3.Error as e:
+            QMessageBox.critical(self, "Database Error", f"Failed to add project: {e}")
+
+    def edit_project_name(self):
+        current_name = self.project_selector.currentText()
+        if not current_name:
+            QMessageBox.warning(self, "Selection Error", "No project selected to edit.")
+            return
+
+        new_name, ok = QInputDialog.getText(self, "Edit Project Name", "Enter new name for project:",
+                                          QLineEdit.Normal, current_name)
+
+        if ok and new_name and new_name.strip() != current_name:
+            new_name = new_name.strip()
+            project_id = self.get_project_id(current_name)
+            if not project_id:
+                QMessageBox.warning(self, "Error", "Selected project not found in database.")
+                return
+            
+            try:
+                self.cursor.execute("UPDATE Projects SET name = ? WHERE id = ?", (new_name, project_id))
+                self.conn.commit()
+                QMessageBox.information(self, "Success", f"Project name updated from '{current_name}' to '{new_name}'.")
+                
+                self.populate_project_selector()
+                idx = self.project_selector.findText(new_name)
+                if idx != -1:
+                    self.project_selector.setCurrentIndex(idx)
+                
+            except sqlite3.IntegrityError:
+                QMessageBox.warning(self, "Duplicate Name", f"Project name '{new_name}' already exists.")
+            except sqlite3.Error as e:
+                QMessageBox.critical(self, "Database Error", f"Failed to update project name: {e}")
+        elif ok and new_name.strip() == current_name:
+            QMessageBox.information(self, "No Change", "Project name is the same as before.")
+
+    def delete_current_project(self):
+        project_name = self.project_selector.currentText()
+        if not project_name:
+            QMessageBox.warning(self, "Selection Error", "No project selected to delete.")
+            return
+
+        project_id = self.get_project_id(project_name)
+        if project_id is None:
+            QMessageBox.warning(self, "Error", "Selected project not found in database.")
+            return
+
+        self.cursor.execute("SELECT COUNT(*) FROM Projects")
+        project_count = self.cursor.fetchone()[0]
+
+        if project_count <= 1:
+            QMessageBox.warning(self, "Cannot Delete", "You cannot delete the last project. Please create at least one new project before attempting to delete this one.")
+            return
+
+        reply = QMessageBox.question(self, "Confirm Deletion",
+                                f"Are you sure you want to delete the project '{project_name}' and all its tasks? This action cannot be undone.",
+                                QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            try:
+                self.cursor.execute("DELETE FROM Projects WHERE id = ?", (project_id,))
+                self.conn.commit()
+                QMessageBox.information(self, "Deletion Successful", f"Project '{project_name}' deleted.")
+                self.populate_project_selector()
+            except sqlite3.Error as e:
+                QMessageBox.critical(self, "Database Error", f"Failed to delete project: {e}")
+
+    def load_all_resources(self):
+        """Loads all unique resources from the Tasks table for both input and filter comboboxes."""
+        self.all_resources.clear()
+        if not self.conn or not self.cursor: return
+
+        try:
+            self.cursor.execute("SELECT DISTINCT resource FROM Tasks WHERE resource IS NOT NULL AND resource != ''")
+            for row in self.cursor.fetchall():
+                self.all_resources.add(row[0])
+            
+            # Update the resource input combobox
+            current_resource_text = self.resource.currentText()
+            self.resource.clear()
+            self.resource.addItems(sorted(list(self.all_resources)))
+            if current_resource_text in self.all_resources:
+                self.resource.setCurrentText(current_resource_text)
+            else:
+                self.resource.setEditText("") # Clear if not found
+
+            # Update the filter resource combobox
+            current_filter_resource = self.filter_resource_combo.currentText()
+            self.filter_resource_combo.blockSignals(True) # Prevent recursive calls
+            self.filter_resource_combo.clear()
+            self.filter_resource_combo.addItem("All")
+            self.filter_resource_combo.addItems(sorted(list(self.all_resources)))
+            if current_filter_resource in self.all_resources or current_filter_resource == "All":
+                self.filter_resource_combo.setCurrentText(current_filter_resource)
+            else:
+                self.filter_resource_combo.setCurrentIndex(0) # Select "All"
+            self.filter_resource_combo.blockSignals(False)
+
+        except sqlite3.Error as e:
+            print(f"Error loading resources: {e}")
+
+    def load_project_description(self):
+        project_name = self.project_selector.currentText()
+        project_id = self.get_project_id(project_name)
+        if project_id:
+            try:
+                self.cursor.execute("SELECT description FROM Projects WHERE id = ?", (project_id,))
+                description = self.cursor.fetchone()[0]
+                self.project_description_text.blockSignals(True)
+                self.project_description_text.setText(description or "")
+                self.project_description_text.blockSignals(False)
+            except sqlite3.Error as e:
+                print(f"Error loading project description: {e}")
+                self.project_description_text.setText("Error loading description.")
+        else:
+            self.project_description_text.clear()
+
+    def save_project_description_on_change(self):
+        project_name = self.project_selector.currentText()
+        project_id = self.get_project_id(project_name)
+        if project_id:
+            description = self.project_description_text.toPlainText()
+            try:
+                self.cursor.execute("UPDATE Projects SET description = ? WHERE id = ?", (description, project_id))
+                self.conn.commit()
+            except sqlite3.Error as e:
+                print(f"Error saving project description: {e}")
+
+    def populate_parent_task_selector(self):
+        """Populates the parent task dropdown with current project's tasks."""
+        self.parent_task_selector.blockSignals(True)
+        self.parent_task_selector.clear()
+        self.parent_task_selector.addItem("--- No Parent ---", userData=None) # Option for top-level task
+
+        # Get all tasks for the current project from the raw data (unfiltered)
+        # This ensures all tasks can be selected as parents, even if currently filtered out
+        all_tasks_for_project = []
+        project_name = self.project_selector.currentText()
+        project_id = self.get_project_id(project_name)
+        if project_id:
+            try:
+                self.cursor.execute("""
+                    SELECT id, task_name, start_date, end_date, resource, completion, remarks, completed_date, parent_task_id
+                    FROM Tasks
+                    WHERE project_id = ?
+                    ORDER BY start_date, task_name COLLATE NOCASE
+                """, (project_id,))
+                task_columns = ["id", "task_name", "start_date", "end_date", "resource", "completion", "remarks", "completed_date", "parent_task_id"]
+                all_tasks_for_project = [dict(zip(task_columns, row)) for row in self.cursor.fetchall()]
+            except sqlite3.Error as e:
+                print(f"Error loading tasks for parent selector: {e}")
+        
+        # Build a temporary TaskNode structure to determine levels for indentation
+        temp_root = TaskNode(None, "TempRoot", "", "", "", 0, "", "", None)
+        temp_nodes = {}
+        for task_row in all_tasks_for_project:
+            node = TaskNode(
+                task_row["id"], task_row["task_name"], task_row["start_date"], 
+                task_row["end_date"], task_row["resource"], task_row["completion"], 
+                task_row["remarks"], task_row["completed_date"], parent_db_id=task_row["parent_task_id"]
+            )
+            temp_nodes[task_row["id"]] = node
+
+        # Link parents for temporary structure
+        for task_row in all_tasks_for_project:
+            node = temp_nodes[task_row["id"]]
+            parent_id = task_row["parent_task_id"]
+            if parent_id is None:
+                temp_root.appendChild(node)
+                node.parent = temp_root
+            elif parent_id in temp_nodes:
+                parent_node = temp_nodes[parent_id]
+                parent_node.appendChild(node)
+                node.parent = parent_node
+            else:
+                temp_root.appendChild(node) # Orphaned tasks to root
+
+        # Recursively get flat data with levels from the temporary tree
+        temp_flat_data_with_levels = []
+        def _get_temp_flat(node, level=0):
+            if node != temp_root:
+                temp_flat_data_with_levels.append({
+                    "id": node.task_id,
+                    "task_name": node.name,
+                    "level": level
+                })
+            for child in node.children:
+                _get_temp_flat(child, level + 1)
+        _get_temp_flat(temp_root)
+
+
+        # Add tasks to the selector, indenting names for subtasks
+        for task_data in temp_flat_data_with_levels:
+            indentation = "  " * task_data.get("level", 0) 
+            display_name = f"{indentation}{task_data['task_name']}"
+            self.parent_task_selector.addItem(display_name, userData=task_data["id"])
+        
+        self.parent_task_selector.blockSignals(False)
+
+    def load_tasks_for_selected_project(self):
+        """Loads tasks for the selected project into the QTreeView (unfiltered raw data)."""
+        project_name = self.project_selector.currentText()
+        project_id = self.get_project_id(project_name)
+
+        self.current_project_tasks_raw = [] # Reset raw data
+
+        if not project_id:
+            self.task_model.setupModelData([]) # Clear the model
+            self.clear_task_input_fields()
+            self.update_project_status()
+            return
+
+        try:
+            self.cursor.execute("""
+                SELECT id, task_name, start_date, end_date, resource, completion, remarks, completed_date, parent_task_id
+                FROM Tasks
+                WHERE project_id = ?
+                ORDER BY start_date, task_name COLLATE NOCASE
+            """, (project_id,))
+            tasks_data = self.cursor.fetchall()
+
+            # Convert to list of dicts for easier processing
+            task_columns = ["id", "task_name", "start_date", "end_date", "resource", "completion", "remarks", "completed_date", "parent_task_id"]
+            self.current_project_tasks_raw = [dict(zip(task_columns, row)) for row in tasks_data]
+            
+            self.apply_filters() # Apply current filters after raw data is loaded
+
+        except sqlite3.Error as e:
+            QMessageBox.critical(self, "Database Error", f"Failed to load tasks: {e}")
+            self.task_model.setupModelData([]) # Clear model on error
+            self.current_project_tasks_raw = []
+        except Exception as e:
+            QMessageBox.critical(self, "Data Processing Error", f"Error displaying tasks: {e}")
+
+    def apply_filters(self):
+        """Applies the current search and filter settings to the tree view."""
+        self.task_model.setFilterText(self.search_task_input.text())
+        self.task_model.setFilterStatus(self.filter_status_combo.currentText())
+        self.task_model.setFilterResource(self.filter_resource_combo.currentText())
+        
+        # Pass the raw (unfiltered) data to the model. The model will handle filtering internally.
+        self.task_model.setupModelData(self.current_project_tasks_raw)
+        
+        self.tree_view.expandAll() # Expand all visible nodes to show sub-tasks
+        
+        for i in range(self.task_model.columnCount()):
+            self.tree_view.resizeColumnToContents(i)
+        
+        self.clear_task_input_fields() # Clear inputs after filtering (as selection might be gone)
+        self.update_project_status() # Re-calculate project status with visible tasks (if relevant, though project status is total)
+
+    def update_project_status(self):
+        """
+        Determines overall project status based on hierarchical task completion (all tasks, not filtered).
+        A project is 'Completed' only if ALL its tasks (including all subtasks) are 100% complete.
+        """
+        # We need to get the status from the full, unfiltered data set
+        # Recreate a temporary root for unfiltered data for status calculation
+        temp_root_unfiltered = TaskNode(None, "Root", "", "", "", 0, "", "", None)
+        all_nodes_unfiltered = {}
+        
+        # First pass: Create all nodes
+        for task_row in self.current_project_tasks_raw:
+            node = TaskNode(
+                task_row["id"], task_row["task_name"], task_row["start_date"], task_row["end_date"],
+                task_row["resource"], task_row["completion"], task_row["remarks"], task_row["completed_date"],
+                parent_db_id=task_row["parent_task_id"]
+            )
+            all_nodes_unfiltered[task_row["id"]] = node
+
+        # Second pass: Link children to parents and add top-level to temp_root
+        for task_row in self.current_project_tasks_raw:
+            node = all_nodes_unfiltered[task_row["id"]]
+            parent_id = task_row["parent_task_id"]
+            if parent_id is None:
+                temp_root_unfiltered.appendChild(node)
+                node.parent = temp_root_unfiltered
+            elif parent_id in all_nodes_unfiltered:
+                parent_node = all_nodes_unfiltered[parent_id]
+                parent_node.appendChild(node)
+                node.parent = parent_node
+            else:
+                temp_root_unfiltered.appendChild(node) # Orphaned tasks to root
+
+
+        if not self.current_project_tasks_raw:
+            self.project_status_label.setText("No Tasks Yet")
+            self.project_status_label.setStyleSheet("QLabel#projectStatusLabel { background-color: #6c757d; }")
+            return
+
+        # Initialize status flags for the entire project
+        has_any_incomplete_task = False
+        has_overdue_tasks = False
+        has_in_progress_tasks = False 
+
+        today = date(2025, 7, 8) # Fixed to Tuesday, July 8, 2025
+
+        def traverse_for_project_status(node):
+            nonlocal has_any_incomplete_task, has_overdue_tasks, has_in_progress_tasks
+            if node != temp_root_unfiltered: # Skip the invisible root node
+                if node.completion < 100:
+                    has_any_incomplete_task = True
+
+                # Check if this node or any of its descendants are overdue
+                if node.is_overdue(today) or node.has_overdue_descendants(today): 
+                    has_overdue_tasks = True
+
+                # Check for in-progress status for this specific node or its descendants
+                if (node.completion > 0 and node.completion < 100) or node.has_any_child_in_progress_or_overdue(today):
+                    has_in_progress_tasks = True
+
+            for child in node.children:
+                traverse_for_project_status(child) # Recursively check children
+
+        traverse_for_project_status(temp_root_unfiltered)
+
+        status_text = ""
+        status_style = ""
+
+        # Determine overall project status hierarchy
+        if not has_any_incomplete_task and temp_root_unfiltered.childCount() > 0:
+            status_text = "Completed"
+            status_style = "QLabel#projectStatusLabel { background-color: #28a745; }" # Green
+        elif has_overdue_tasks:
+            status_text = "Overdue"
+            status_style = "QLabel#projectStatusLabel { background-color: #dc3545; }" # Red
+        elif has_in_progress_tasks:
+            status_text = "In Progress"
+            status_style = "QLabel#projectStatusLabel { background-color: #007bff; }" # Blue
+        else: # All tasks are 0% and not overdue, or no tasks exist
+            status_text = "Not Yet Started"
+            status_style = "QLabel#projectStatusLabel { background-color: #6c757d; }" # Grey
+
+        self.project_status_label.setText(status_text)
+        self.project_status_label.setStyleSheet(status_style)
+
+
+    def clear_task_input_fields(self):
+        """Clears the task input fields and resets the add/update button."""
+        self.task_name.clear()
+        self.start_date.setDate(QDate.currentDate())
+        self.end_date.setDate(QDate.currentDate().addDays(7))
+        
+        self.resource.setEditText("")
+        self.completion.setText("0")
+        self.remarks.clear()
+        self.parent_task_selector.setCurrentIndex(0) # Select "--- No Parent ---"
+        self.selected_task_node = None
+        self.add_update_task_btn.setText("Add Task")
+        self.add_update_task_btn.setToolTip("Add a new task to the current project")
+        self.tree_view.clearSelection()
+
+    def load_task_to_fields(self, index):
+        """Loads data from the clicked tree view item into the input fields for editing."""
+        if not index.isValid():
+            self.clear_task_input_fields()
+            return
+
+        node = self.task_model.nodeFromIndex(index)
+        self.selected_task_node = node # Store the selected TaskNode object
+
+        self.task_name.setText(node.name)
+        self.start_date.setDate(QDate.fromString(node.start_date, "yyyy-MM-dd"))
+        self.end_date.setDate(QDate.fromString(node.end_date, "yyyy-MM-dd"))
+        
+        self.resource.setEditText(node.resource or "") # Handle None
+        self.completion.setText(str(node.completion))
+        self.remarks.setText(node.remarks or "") # Handle None
+
+        # Set the parent task selector
+        parent_id = node.parent_db_id
+        if parent_id is None:
+            self.parent_task_selector.setCurrentIndex(0) # "--- No Parent ---"
+        else:
+            # Find the index of the parent in the combo box by userData (task_id)
+            idx = self.parent_task_selector.findData(parent_id)
+            if idx != -1:
+                self.parent_task_selector.setCurrentIndex(idx)
+            else:
+                self.parent_task_selector.setCurrentIndex(0) # Fallback if parent not found
+
+        self.add_update_task_btn.setText("Update Task")
+        self.add_update_task_btn.setToolTip(f"Update selected task (ID: {node.task_id})")
+
+    def add_or_update_task(self):
+        """Handles adding a new task or updating an existing one."""
+        project_name = self.project_selector.currentText()
+        project_id = self.get_project_id(project_name)
+        if not project_id:
+            QMessageBox.warning(self, "Selection Error", "Please select or create a project first.")
+            return
+
+        task = self.task_name.text().strip()
+        start = self.start_date.date().toString("yyyy-MM-dd")
+        end = self.end_date.date().toString("yyyy-MM-dd")
+        resource = self.resource.currentText().strip() or None # Store empty string as None
+        completion_str = self.completion.text().strip()
+        remarks = self.remarks.toPlainText().strip() or None # Store empty string as None
+
+        # Get parent task ID from the selector
+        parent_task_id = self.parent_task_selector.currentData() # This will be None for "--- No Parent ---"
+
+        if not task:
+            QMessageBox.warning(self, "Input Error", "Task name cannot be empty.")
+            return
+
+        if self.start_date.date() > self.end_date.date():
+            QMessageBox.warning(self, "Date Error", "End date cannot be before start date.")
+            return
+
+        try:
+            completion = int(completion_str)
+            if not (0 <= completion <= 100):
+                raise ValueError
+        except ValueError:
+            QMessageBox.warning(self, "Input Error", "Completion percentage must be a number between 0 and 100.")
+            return
+
+        # Prevent a task from being its own parent
+        if self.selected_task_node and parent_task_id == self.selected_task_node.task_id:
+            QMessageBox.warning(self, "Parent Error", "A task cannot be its own parent.")
+            return
+        
+        # Prevent a task from being a parent of its own ancestor (create a loop)
+        if self.selected_task_node and parent_task_id:
+            # We need to check against the full raw data, not just what's currently filtered
+            # Create a temporary TaskNode structure from current_project_tasks_raw for path checking
+            temp_all_nodes = {}
+            temp_root = TaskNode(None, "TempRoot", "", "", "", 0, "", "", None)
+            
+            for task_row in self.current_project_tasks_raw:
+                node = TaskNode(task_row["id"], "", "", "", "", 0, "", "", parent_db_id=task_row["parent_task_id"])
+                temp_all_nodes[task_row["id"]] = node
+            
+            # Link children for correct parent traversal for all tasks
+            for task_id, node_obj in temp_all_nodes.items():
+                if node_obj.parent_db_id is not None and node_obj.parent_db_id in temp_all_nodes:
+                    temp_all_nodes[node_obj.parent_db_id].appendChild(node_obj)
+                    node_obj.parent = temp_all_nodes[node_obj.parent_db_id]
+                else:
+                    temp_root.appendChild(node_obj) # Add top-level tasks to a dummy root for traversal
+                    node_obj.parent = temp_root
+
+            target_parent_node = temp_all_nodes.get(parent_task_id)
+            if target_parent_node:
+                current = target_parent_node
+                while current and current.task_id != self.selected_task_node.task_id and current != temp_root:
+                    current = current.parent # Traverse up
+                    if current and current.task_id == self.selected_task_node.task_id:
+                        QMessageBox.warning(self, "Parent Error", "Circular dependency detected! A task cannot be a parent of its own ancestor.")
+                        return
+
+        completed_date = None
+        if completion == 100:
+            if self.selected_task_node and self.selected_task_node.completion == 100 and self.selected_task_node.completed_date:
+                completed_date = self.selected_task_node.completed_date # Keep original completed date if already 100%
+            else:
+                completed_date = date(2025, 7, 8).strftime("%Y-%m-%d") # Use fixed date
+        elif self.selected_task_node and self.selected_task_node.completion == 100 and completion < 100:
+            completed_date = None # Clear completed date if completion drops from 100%
+        elif self.selected_task_node:
+            completed_date = self.selected_task_node.completed_date # Maintain existing if not 100%
+
+
+        try:
+            if self.selected_task_node is None:
+                # Add new task
+                self.cursor.execute("""
+                    INSERT INTO Tasks (project_id, task_name, start_date, end_date, resource, completion, remarks, completed_date, parent_task_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (project_id, task, start, end, resource, completion, remarks, completed_date, parent_task_id))
+                self.conn.commit()
+                QMessageBox.information(self, "Task Added", f"Task '{task}' added to '{project_name}'.")
+            else:
+                # Update existing task
+                self.cursor.execute("""
+                    UPDATE Tasks SET task_name = ?, start_date = ?, end_date = ?, resource = ?, completion = ?, remarks = ?, completed_date = ?, parent_task_id = ?
+                    WHERE id = ? AND project_id = ?
+                """, (task, start, end, resource, completion, remarks, completed_date, parent_task_id, self.selected_task_node.task_id, project_id))
+                self.conn.commit()
+                if self.cursor.rowcount > 0:
+                    QMessageBox.information(self, "Task Updated", f"Task '{task}' updated in '{project_name}'.")
+                else:
+                    QMessageBox.warning(self, "Update Error", "Could not update task. It might have been deleted by another action or the data was unchanged.")
+
+            self.load_all_resources() # Refresh resource list (for input and filter)
+            self.load_tasks_for_selected_project() # Reload all tasks to refresh hierarchy and re-apply filters
+            self.clear_task_input_fields()
+            self.update_project_status() # Re-calculate project status after changes
+            
+            self.populate_parent_task_selector() # Refresh parent task dropdown after task changes
+
+        except sqlite3.Error as e:
+            QMessageBox.critical(self, "Database Error", f"Failed to add/update task: {e}")
+        except Exception as e:
+            QMessageBox.critical(self, "Application Error", f"An unexpected error occurred: {e}")
+
+
+    def delete_selected_tasks(self):
+        project_name = self.project_selector.currentText()
+        project_id = self.get_project_id(project_name)
+        if not project_id:
+            QMessageBox.warning(self, "Selection Error", "No project selected.")
+            return
+
+        selected_indexes = self.tree_view.selectedIndexes()
+        if not selected_indexes:
+            QMessageBox.warning(self, "Selection Error", "Please select at least one task to delete.")
+            return
+
+        # Get unique top-level nodes of selected items to avoid deleting children multiple times
+        selected_nodes = set()
+        for index in selected_indexes:
+            if index.column() == 0: # Only process the first column index to get the node once
+                selected_nodes.add(self.task_model.nodeFromIndex(index))
+        
+        if not selected_nodes:
+            QMessageBox.warning(self, "Deletion Error", "No valid tasks selected for deletion.")
+            return
+
+        # Extract the database IDs of the selected nodes
+        tasks_to_delete_ids = [node.task_id for node in selected_nodes if node.task_id is not None]
+
+        if not tasks_to_delete_ids:
+            QMessageBox.warning(self, "Deletion Error", "No valid tasks with database IDs selected for deletion.")
+            return
+
+        reply = QMessageBox.question(self, "Confirm Deletion",
+                                f"Are you sure you want to delete {len(tasks_to_delete_ids)} selected task(s) and their subtasks (if any)? This action cannot be undone.",
+                                QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            try:
+                self.conn.execute("BEGIN TRANSACTION")
+                
+                for task_db_id in tasks_to_delete_ids:
+                    # Due to ON DELETE CASCADE, deleting a parent task will automatically delete its children
+                    self.cursor.execute("DELETE FROM Tasks WHERE id = ? AND project_id = ?", (task_db_id, project_id))
+
+                self.conn.commit()
+                QMessageBox.information(self, "Deletion Successful", f"{len(tasks_to_delete_ids)} top-level task(s) (and their subtasks) deleted.")
+
+                self.load_all_resources() # Refresh resource list
+                self.load_tasks_for_selected_project() # Reload all tasks to refresh hierarchy and re-apply filters
+                self.clear_task_input_fields()
+                self.update_project_status() # Re-calculate project status after deletion
+
+            except sqlite3.Error as e:
+                self.conn.rollback()
+                QMessageBox.critical(self, "Database Error", f"Failed to delete tasks: {e}")
+
+    def generate_and_open_gantt_chart(self):
+        project_name = self.project_selector.currentText()
+        if not project_name:
+            QMessageBox.warning(self, "No Data", "No project selected to generate a Gantt chart.")
+            return
+
+        # Get all tasks in a flat list from the model (includes level for indentation)
+        # Use current filtered/displayed data for Gantt chart
+        tasks_flat_data = self.task_model.get_all_flat_tasks_data()
+        if not tasks_flat_data:
+            QMessageBox.information(self, "No Tasks", "No tasks available for the current project to create a Gantt chart.")
+            return
+
+        # Prepare data for DataFrame, adding indentation to task names
+        gantt_data = []
+        for task in tasks_flat_data:
+            indentation = "  " * task.get("level", 0)
+            display_name = f"{indentation}{task['task_name']}"
+            gantt_data.append({
+                'Task': display_name,
+                'Start': task['start_date'],
+                'Finish': task['end_date'],
+                'Resource': task['resource'],
+                'Completion': task['completion'],
+                'Remarks': task['remarks'],
+                'Status': task['status_text'] # Use the calculated status
+            })
+        
+        df = pd.DataFrame(gantt_data)
+
+        try:
+            df['Start'] = pd.to_datetime(df['Start'], errors='coerce')
+            df['Finish'] = pd.to_datetime(df['Finish'], errors='coerce')
+            df.dropna(subset=['Start', 'Finish'], inplace=True)
+
+            if df.empty:
+                QMessageBox.warning(self, "Gantt Chart Error", "No valid task dates found for Gantt chart generation after processing. Please check task dates.")
+                return
+
+        except Exception as e:
+            QMessageBox.critical(self, "Date Processing Error", f"Failed to process dates for Gantt chart: {e}")
+            return
+
+        try:
+            # Define color map for Gantt chart based on status
+            color_map = {
+                "Completed": "#28a745",    # Green
+                "Overdue": "#dc3545",      # Red (for overdue tasks)
+                "In Progress": "#007bff",  # Blue
+                "Not Started": "#6c757d"   # Grey
+            }
+
+            fig = px.timeline(df, x_start="Start", x_end="Finish", y="Task", color="Status", # Color by Status
+                              color_discrete_map=color_map, # Apply specific colors from our map
+                              hover_data={"Start": "|%Y-%m-%d",
+                                          "Finish": "|%Y-%m-%d",
+                                          "Completion": True,
+                                          "Resource": True,
+                                          "Remarks": True,
+                                          "Status": True}, # Include Status in hover data
+                              title=f"<b>Gantt Chart: {project_name}</b>")
+
+            fig.update_yaxes(autorange="reversed", title_text="Task")
+            fig.update_xaxes(title_text="Date")
+            fig.update_layout(
+                font_family="Segoe UI",
+                title_font_size=24,
+                title_font_color="#333",
+                xaxis_title_font_size=16,
+                yaxis_title_font_size=16,
+                xaxis=dict(showgrid=True, gridcolor='#e0e0e0'),
+                yaxis=dict(showgrid=True, gridcolor='#e0e0e0'),
+                plot_bgcolor='white',
+                paper_bgcolor='#f0f2f5',
+                margin=dict(l=50, r=50, t=90, b=50),
+                hoverlabel=dict(bgcolor="white", font_size=14, font_family="Segoe UI")
+            )
+
+            html_string = fig.to_html(include_plotlyjs='cdn')
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode='w', encoding='utf-8') as f:
+                f.write(html_string)
+                file_path = f.name
+            
+            webbrowser.open_new_tab(f"file:///{file_path.replace(os.sep, '/')}")
+            QMessageBox.information(self, "Chart Opened", f"Gantt chart opened in your default web browser.\nTemporary file: {file_path}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Gantt Chart Error", f"Failed to generate or open Gantt chart in browser: {e}")
+
+    def export_to_excel(self):
+        project_name = self.project_selector.currentText()
+        if not project_name:
+            QMessageBox.warning(self, "No Data", "No project selected to export.")
+            return
+
+        # Get all tasks in a flat list from the model's *current visible data*
+        # This will export the filtered view
+        tasks_to_export = self.task_model.get_all_flat_tasks_data()
+        
+        if not tasks_to_export:
+            QMessageBox.warning(self, "No Data", "No tasks to export for the current project (or no tasks match current filters).")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(self, "Save Project Tasks", f"{project_name}_tasks.xlsx", "Excel Files (*.xlsx)")
+        if path:
+            df = pd.DataFrame(tasks_to_export)
+
+            if not df.empty:
+                try:
+                    df['start_date'] = pd.to_datetime(df['start_date'], errors='coerce')
+                    df['end_date'] = pd.to_datetime(df['end_date'], errors='coerce')
+
+                    initial_rows = len(df)
+                    df.dropna(subset=['start_date', 'end_date'], inplace=True)
+                    if len(df) < initial_rows:
+                        QMessageBox.warning(self, "Data Warning", 
+                                            f"Some tasks were skipped from export due to invalid or missing start/end dates. "
+                                            f"Original: {initial_rows}, Exported: {len(df)}.")
+                    
+                    if df.empty:
+                        QMessageBox.information(self, "Export Cancelled", "No valid tasks with dates found to export after cleaning.")
+                        return
+
+                    today_timestamp = pd.Timestamp(date(2025, 7, 8)) # Use fixed date
+
+                    df['Duration (Days)'] = (df['end_date'] - today_timestamp).dt.days + 1
+                    df['Pending Days'] = (df['end_date'] - today_timestamp).dt.days
+                    
+                    # Add indentation to Task Name for hierarchical representation in Excel
+                    df['Task No.'] = df.apply(lambda row: row['level'] * "  " + str(df.loc[:row.name].loc[df['level'] == row['level']].shape[0]) if row['level'] > 0 else str(df.loc[:row.name].loc[df['level'] == 0].shape[0]), axis=1)
+
+                    df['Task Name (Hierarchical)'] = df.apply(
+                        lambda row: ("  " * row.get('level', 0)) + row['task_name'], axis=1
+                    )
+
+                    export_columns = [
+                        "Task No.", "Task Name (Hierarchical)", "task_name", "start_date", "end_date", "Duration (Days)", "Pending Days",
+                        "resource", "completion", "remarks", "completed_date", "status_text", "id", "parent_task_id"
+                    ]
+                    
+                    # Ensure all columns exist before selecting
+                    for col in export_columns:
+                        if col not in df.columns:
+                            df[col] = None
+
+                    df_export = df[export_columns]
+                    
+                    df_export = df_export.rename(columns={
+                        'task_name': 'Task Name (Flat)', # Renamed for clarity in Excel
+                        'start_date': 'Start Date',
+                        'end_date': 'End Date',
+                        'resource': 'Resource',
+                        'completion': 'Completion %',
+                        'remarks': 'Remarks',
+                        'completed_date': 'Completed Date',
+                        'status_text': 'Status',
+                        'id': 'Task ID',
+                        'parent_task_id': 'Parent Task ID'
+                    })
+
+                    df_export.to_excel(path, index=False)
+                    QMessageBox.information(self, "Export Successful", f"Tasks exported to:\n{path}")
+                except PermissionError:
+                    QMessageBox.critical(self, "Export Error", f"Permission denied. Please close the Excel file if it's open and try again, or save to a different location.")
+                except Exception as e:
+                    QMessageBox.critical(self, "Export Error", f"Failed to export tasks to Excel: {e}")
+            else:
+                QMessageBox.information(self, "Export Info", "No tasks to export for this project.")
+
+    def closeEvent(self, event):
+        if self.conn:
+            self.conn.close()
+        super().closeEvent(event)
+        event.accept()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = ProjectManagerApp()
+    window.show()
+    sys.exit(app.exec_())
